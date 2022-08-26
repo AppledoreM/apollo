@@ -4,6 +4,7 @@
 #include <random>
 #include <chrono>
 
+
 namespace apollo
 {
     namespace algorithm
@@ -51,6 +52,7 @@ namespace apollo
                     }
                 }
                 __syncthreads();
+                // TODO: Make this faster
                 if(tid + 1 == partitionSize && tid + offset < size) data[partitionSize] = data[tid] + inData[tid + offset]; 
                 if(tid + offset < size) inData[tid + offset] = data[tid + 1];
                 __syncthreads();
@@ -58,37 +60,18 @@ namespace apollo
                 if(!tid) blockSum[blockIdx.x] = data[partitionSize];
             }
 
-            template<typename T>
-            __global__ void preprocessPrefixSumBlockSum(T* blockSum, size_t numBlocks)
-            {
-
-                size_t tid = threadIdx.x + blockIdx.x * blockDim.x;
-
-                if(tid < numBlocks)
-                {
-                    T temp = blockSum[tid];
-                    __syncthreads();
-
-                    for(size_t i = tid + 1; i < numBlocks; ++i)
-                    {
-                        atomicAdd(&blockSum[i], temp);
-                    }
-                }
-
-            }
 
             template<typename T>
             __global__ void distributPrefixBlockSum(T* inData, T* blockSum, size_t size)
             {
                 __shared__ T _sum;
                 size_t tid = threadIdx.x + blockIdx.x * blockDim.x;
-                if(!threadIdx.x)
+                if(threadIdx.x == 0)
                 {
                     if(blockIdx.x) _sum = blockSum[blockIdx.x - 1];
                     else _sum = 0;
                 }
                 __syncthreads();
-
 
                 if(tid < size) inData[tid] += _sum;
             }
@@ -98,31 +81,38 @@ namespace apollo
         {
 
             template<size_t partitionSize, typename T>
-            void kernelWrapper(T* arr, T* blockSum, T* temp0, T* temp1, size_t size, size_t numBlocks)
+            void kernelWrapper(T* arr, std::vector<T*>& blockSumLevels, size_t size, const std::vector<size_t>& numBlocksPerLevel)
             {
 
-                apollo::algorithm::kernel::prefixSum<partitionSize> <<<numBlocks, 1024>>>(arr, blockSum, size);
+                apollo::algorithm::kernel::prefixSum<partitionSize> <<<numBlocksPerLevel[0], 1024>>>(arr, blockSumLevels[0], size);
                 cudaDeviceSynchronize();
 
-                size_t numGrids0 = numBlocks / 1024 + (numBlocks % 1024 != 0);
-                /* apollo::algorithm::kernel::preprocessPrefixSumBlockSum<<<numGrids0, 1024>>>(blockSum, numBlocks); */
-                /* cudaDeviceSynchronize(); */
-
-                apollo::algorithm::kernel::prefixSum<partitionSize> <<<numGrids0, 1024>>>(blockSum, temp0, numBlocks);
-                cudaDeviceSynchronize();
-
-                if(numGrids0 > 1)
+                for(uint32_t i = 1; i < numBlocksPerLevel.size(); ++i)
                 {
-                    size_t numGrids1 = numGrids0 / 1024 + (numGrids0 % 1024 != 0);
-                    apollo::algorithm::kernel::prefixSum<partitionSize> <<<numGrids1, 1024>>>(temp0, temp1, numGrids0);
-                    cudaDeviceSynchronize();
-                    apollo::algorithm::kernel::distributPrefixBlockSum<<<numGrids1, 1024>>>(temp0, temp1, numGrids0);
+                    apollo::algorithm::kernel::prefixSum<partitionSize> 
+                        <<<numBlocksPerLevel[i], 1024>>>(blockSumLevels[i - 1], blockSumLevels[i], numBlocksPerLevel[i - 1]);
                     cudaDeviceSynchronize();
                 }
 
-                apollo::algorithm::kernel::distributPrefixBlockSum<<<numGrids0, 1024>>>(blockSum, temp0, numBlocks);
-                cudaDeviceSynchronize();
-                apollo::algorithm::kernel::distributPrefixBlockSum<<<numBlocks, 1024>>>(arr, blockSum, size);
+
+                for(uint32_t i = numBlocksPerLevel.size() - 1; i > 0; --i)
+                {
+                    auto* partialSum = new T[numBlocksPerLevel[i - 1]];
+                    printf("Distribute Level %u\n", i);
+                    apollo::algorithm::kernel::distributPrefixBlockSum
+                        <<<numBlocksPerLevel[i], 1024>>>(blockSumLevels[i - 1], blockSumLevels[i], numBlocksPerLevel[i - 1]);
+                    cudaDeviceSynchronize();
+                    cudaMemcpy(partialSum, blockSumLevels[i - 1], numBlocksPerLevel[i - 1] * sizeof(T), cudaMemcpyDeviceToHost);
+                    printf("Partial Sum Level %u\n", i);
+                    for(int j = 0; j < numBlocksPerLevel[i - 1]; ++j)
+                    {
+                        printf("%f, ", partialSum[j]);
+                    }
+                    delete[] partialSum;
+                    printf("\n");
+                }
+
+                apollo::algorithm::kernel::distributPrefixBlockSum<<<numBlocksPerLevel[0], 1024>>>(arr, blockSumLevels[0], size);
                 cudaDeviceSynchronize();
             }
         }
@@ -135,20 +125,29 @@ namespace apollo
 typedef double DataType;
 int main()
 {
-    constexpr auto arrayLength = 1 << 28;
-    auto* arr = new DataType[arrayLength];
-    auto* sum = new DataType[arrayLength];
 
     apollo::algorithm::APGPrefixSum<DataType> ps;
 
     std::chrono::time_point<std::chrono::steady_clock> start, end;
-    for(int epoch = 0; epoch < 100; ++epoch)
+    std::random_device dev;
+    std::mt19937 random_engine(dev());
+    std::uniform_int_distribution<std::mt19937::result_type> dist(0, 1);
+    std::uniform_int_distribution<std::mt19937::result_type> sizeDist(1, 1 << 22);
+
+    bool allMatch = true;
+    float cpuTime = 0;
+    float gpuTime = 0;
+
+    std::vector<DataType> arr, sum, gpu;
+    for(int epoch = 0; epoch < 10; ++epoch)
     {
+        size_t arrayLength = sizeDist(random_engine);
+        arr.resize(arrayLength);
+        sum.resize(arrayLength);
+        gpu.resize(arrayLength);
+
+
         {
-            
-            std::random_device dev;
-            std::mt19937 random_engine(dev());
-            std::uniform_int_distribution<std::mt19937::result_type> dist(0, 100);
             for(int i = 0; i < arrayLength; ++i)
             {
                 arr[i] = dist(random_engine);
@@ -163,30 +162,45 @@ int main()
             start = std::chrono::steady_clock::now();
             for(int i = 1; i < arrayLength; ++i) sum[i] += sum[i - 1];
             end = std::chrono::steady_clock::now();
-            std::cout << "CPU Add Finished! Used time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms\n";
+            cpuTime += std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
         }
 
         // GPU Prefix Sum
         {
             start = std::chrono::steady_clock::now();
-            ps.prefixSum<1024>(arr, arr, arrayLength);
+            ps.prefixSum<1024>(arr.data(), gpu.data(), arrayLength);
             end = std::chrono::steady_clock::now();
-            std::cout << "GPU Add Finished! Used time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms\n";
+            gpuTime += std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
         }
 
         {
             for(int i = 0; i < arrayLength; ++i)
             {
-                if(std::abs(arr[i] - sum[i]) > 0.0001)
+                if(std::abs(gpu[i] - sum[i]) > 0.0001)
                 {
-                    std::cout << arr[i] << " " << sum[i] << std::endl;
+
+                    printf("----------------ERROR LOG---------------\n");
+                    for(int j = i; j <= i; ++j)
+                    {
+                        std::cout << "Size: " <<  arrayLength << \
+                            " Index: " << j << \
+                            " Original: " << arr[j] \
+                            << " GPU Results: " << gpu[j] << \
+                            " CPU Results: " << sum[j] << std::endl;
+                    }
                     match = false;
                     break;
                 }
             }
-            if(!match) printf("Results mismatch!\n");
-            else printf("Results match!\n");
-        
+            if(!match) 
+            {
+                allMatch = false;
+                printf("Results mismatch!\n");
+                break;
+            }
         }
     }
+    if(allMatch) printf("All Results Match!\n");
+    std::cout << "CPU Average Used Time: " << cpuTime / 100 << "ms\n";
+    std::cout << "GPU Average Used Time: " << gpuTime / 100 << "ms\n";
 }
